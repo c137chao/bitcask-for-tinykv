@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -28,41 +30,33 @@ type DataFile struct {
 	IoManager fio.IOManager
 }
 
-// open data file in dirpath with fid, full path is format as /dirpath/xxxxx.data, xxx is fid
-func OpenDataFile(dirPath string, fid uint32) (*DataFile, error) {
+// open or create file in dirpath with fid,
+//  full path is format as /dirpath/xxx.data, xxx is fid
+func OpenDataFile(dirPath string, fid uint32, iotype fio.FileIOType) (*DataFile, error) {
 	filename := filepath.Join(dirPath, fmt.Sprintf("%09d", fid)+DataFileSuffix)
-
-	// open file with fio
-	// if file doesn't exist, create it
-	return newDataFile(filename, fid)
+	return newDataFile(filename, fid, iotype)
 }
 
 // Open Hint file, Hint file is consist of all records in index
 func OpenHintFile(dirPath string) (*DataFile, error) {
 	filename := filepath.Join(dirPath, HintFileName)
-
-	return newDataFile(filename, 0)
-
+	return newDataFile(filename, 0, fio.StandFileIO)
 }
 
 // Merge Finish File exist present merging complete
 func OpenMergeFinFile(dirPath string) (*DataFile, error) {
 	fileName := filepath.Join(dirPath, HintFinFileName)
-	return newDataFile(fileName, 0)
+	return newDataFile(fileName, 0, fio.StandFileIO)
 }
 
-func newDataFile(fileName string, fid uint32) (*DataFile, error) {
-	ioManager, err := fio.NewIOManager(fileName)
+func newDataFile(fileName string, fid uint32, iotype fio.FileIOType) (*DataFile, error) {
+	ioManager, err := fio.NewIOManager(fileName, iotype)
 	size, _ := ioManager.Size()
 	if err != nil {
 		return nil, err
 	}
 
-	return &DataFile{
-		FileId:    fid,
-		WriteOff:  size,
-		IoManager: ioManager,
-	}, nil
+	return &DataFile{FileId: fid, WriteOff: size, IoManager: ioManager}, nil
 }
 
 // format filename as dirPath/fid.data
@@ -73,13 +67,12 @@ func GetDataFileName(dirPath string, fid uint32) string {
 
 // format binary sequence using Item {key, position}, and write it to IO stream
 func (df *DataFile) WriteHintRecord(key []byte, pos *LogRecordPos) error {
-	record := &LogRecord{
+	hintRecord := &LogRecord{
 		Key:   key,                     // key is already binary seq
 		Value: EncodeLogRecordPos(pos), // encode position as binary sequence
 	}
 
-	// caculate header of record and encode to binary
-	encRecord, _ := EncodeLogRecord(record)
+	encRecord, _ := EncodeLogRecord(hintRecord)
 
 	return df.Write(encRecord)
 }
@@ -113,27 +106,28 @@ func (df *DataFile) ReadLogRecord(offset int64) (*LogRecord, int64, error) {
 		return nil, 0, io.EOF
 	}
 
-	if header.Crc == 0 && header.KeySize == 0 && header.ValSize == 0 {
+	if header.crc == 0 && header.keySize == 0 && header.valSize == 0 {
 		return nil, 0, io.EOF
 	}
 
 	// read Log record
-	var kvSize int64 = int64(header.KeySize + header.ValSize)
+	var kvSize int64 = int64(header.keySize + header.valSize)
 	logRecordSize := headerSize + kvSize
-	logRecord := &LogRecord{Type: header.RecordType}
+	logRecord := &LogRecord{Type: header.recordType}
 
 	if kvSize > 0 {
 		kvBuf, err := df.ReadNBytes(kvSize, offset+headerSize)
 		if err != nil {
 			return nil, 0, err
 		}
-		logRecord.Key = kvBuf[:header.KeySize]
-		logRecord.Value = kvBuf[header.KeySize:]
+		logRecord.Key = kvBuf[:header.keySize]
+		logRecord.Value = kvBuf[header.keySize:]
 	}
 
 	// check CRC
 	crc := getRecordCRC(logRecord, headerBuf)
-	if crc != header.Crc {
+	if crc != header.crc {
+		logrus.Errorf("crc checking code doesn't match at file %v offset %v", df.FileId, offset)
 		return nil, 0, ErrInvalidCRC
 	}
 
@@ -169,4 +163,18 @@ func (df *DataFile) ReadNBytes(n int64, offset int64) ([]byte, error) {
 	buf := make([]byte, n)
 	_, err := df.IoManager.Read(buf, offset)
 	return buf, err
+}
+
+// close old ioManager and create new IoManger with specified IO type
+func (df *DataFile) SetIoMananger(dirPath string, iotype fio.FileIOType) error {
+	if err := df.IoManager.Close(); err != nil {
+		return err
+	}
+	ioManager, err := fio.NewIOManager(GetDataFileName(dirPath, df.FileId), iotype)
+	if err != nil {
+		return err
+	}
+
+	df.IoManager = ioManager
+	return nil
 }

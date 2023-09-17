@@ -1,7 +1,6 @@
 package bitcaskgo
 
 import (
-	"bitcask-go/index"
 	"log"
 	"os"
 	"testing"
@@ -9,15 +8,11 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-var dir, _ = os.MkdirTemp("", "bitcask-go-iteraotr")
-var opts = Options{
-	DirPath:   dir,
-	Maxsize:   256 * 1024 * 1024,
-	SyncWrite: false,
-	Index:     index.BTREE,
-}
-
 func TestDB_EmptyIterator(t *testing.T) {
+	var dir, _ = os.MkdirTemp("", "bitcask-go-iteraotr")
+	var opts = DefaultOptions
+	opts.DirPath = dir
+
 	db, err := OpenDB(opts)
 	defer destroyDB(db)
 
@@ -30,6 +25,10 @@ func TestDB_EmptyIterator(t *testing.T) {
 }
 
 func TestDB_Iterator_Basic(t *testing.T) {
+	var dir, _ = os.MkdirTemp("", "bitcask-go-iteraotr")
+	var opts = DefaultOptions
+	opts.DirPath = dir
+
 	db, err := OpenDB(opts)
 	defer destroyDB(db)
 
@@ -52,6 +51,10 @@ func TestDB_Iterator_Basic(t *testing.T) {
 }
 
 func TestDB_Iterator_Seek(t *testing.T) {
+	var dir, _ = os.MkdirTemp("", "bitcask-go-iteraotr")
+	var opts = DefaultOptions
+	opts.DirPath = dir
+
 	db, err := OpenDB(opts)
 	defer destroyDB(db)
 
@@ -74,6 +77,10 @@ func TestDB_Iterator_Seek(t *testing.T) {
 }
 
 func TestDB_Iterator_Prefix(t *testing.T) {
+	var dir, _ = os.MkdirTemp("", "bitcask-go-iteraotr")
+	var opts = DefaultOptions
+	opts.DirPath = dir
+
 	db, err := OpenDB(opts)
 	defer destroyDB(db)
 

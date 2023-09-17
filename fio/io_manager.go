@@ -1,5 +1,12 @@
 package fio
 
+type FileIOType = byte
+
+const (
+	StandFileIO FileIOType = iota
+	MemoryMapIO
+)
+
 type IOManager interface {
 	// read data at offset from file to byte array, return size of read
 	Read([]byte, int64) (int, error)
@@ -18,6 +25,13 @@ type IOManager interface {
 }
 
 //
-func NewIOManager(filename string) (IOManager, error) {
-	return NewFileIOManager(filename)
+func NewIOManager(filename string, ioType FileIOType) (IOManager, error) {
+	switch ioType {
+	case StandFileIO:
+		return NewFileIOManager(filename)
+	case MemoryMapIO:
+		return NewMMapIOManager(filename)
+	default:
+		panic("unsupport io type")
+	}
 }

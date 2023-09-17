@@ -11,23 +11,26 @@ const nonTxnSeqno uint64 = 0
 
 var txnFinKey = []byte("txn-fin")
 
+// to support atomic write
+// writebatch append a fin record to tag write has been complete
 type WriteBatch struct {
-	Options       WriteBatchOptions
 	mu            *sync.Mutex
 	bitCaskDB     *DB
+	options       WriteBatchOptions
 	pendingWrites map[string]*data.LogRecord
 }
 
 func (db *DB) NewWriteBatch(opts WriteBatchOptions) *WriteBatch {
 	return &WriteBatch{
-		Options:       opts,
 		mu:            new(sync.Mutex),
 		bitCaskDB:     db,
+		options:       opts,
 		pendingWrites: make(map[string]*data.LogRecord),
 	}
 }
 
-// put kv to pending write, it update to file and index when commit
+// put kv to pending write
+// it sync to disk file and index when commit
 func (wb *WriteBatch) Put(key, value []byte) error {
 	if len(key) == 0 {
 		return ErrKeyIsEmpty
@@ -58,11 +61,12 @@ func (wb *WriteBatch) Delete(key []byte) error {
 
 	pos := wb.bitCaskDB.index.Get(key)
 
-	// if delete un-commit or un-exist deokey
+	// if delete un-commit or un-exist logrecord
 	if pos == nil {
 		if wb.pendingWrites[string(key)] != nil {
 			delete(wb.pendingWrites, string(key))
 		}
+		// else delete a log has never been put ???
 		return nil
 	}
 
@@ -72,7 +76,7 @@ func (wb *WriteBatch) Delete(key []byte) error {
 	return nil
 }
 
-// commit pending writes to disT file and index
+// commit pending writes to disk file and index
 func (wb *WriteBatch) Commit() error {
 	wb.mu.Lock()
 	defer wb.mu.Unlock()
@@ -81,7 +85,7 @@ func (wb *WriteBatch) Commit() error {
 		return nil
 	}
 
-	if len(wb.pendingWrites) > wb.Options.MaxBatchSize {
+	if len(wb.pendingWrites) > wb.options.MaxBatchSize {
 		return ErrExceedMaxBatch
 	}
 
@@ -89,9 +93,8 @@ func (wb *WriteBatch) Commit() error {
 	defer wb.bitCaskDB.mu.Unlock()
 
 	// increase sequence nubmer as current transaction number
-	txnSeq := atomic.AddUint64(&wb.bitCaskDB.txnSeq, 1)
+	txnSeq := atomic.AddUint64(&wb.bitCaskDB.txnSeqNo, 1)
 
-	//
 	postions := make(map[string]*data.LogRecordPos)
 	for _, record := range wb.pendingWrites {
 		log := &data.LogRecord{
@@ -119,7 +122,7 @@ func (wb *WriteBatch) Commit() error {
 	}
 
 	// persist
-	if wb.Options.SynWrites && wb.bitCaskDB.activeFile != nil {
+	if wb.options.SynWrites && wb.bitCaskDB.activeFile != nil {
 		if err := wb.bitCaskDB.activeFile.Sync(); err != nil {
 			return err
 		}
@@ -137,7 +140,7 @@ func (wb *WriteBatch) Commit() error {
 	return nil
 }
 
-// return encode []byte for seq+key
+// encode seq+key to bytes
 func logRecordKeyWithSeq(key []byte, seqNo uint64) []byte {
 	seq := make([]byte, binary.MaxVarintLen64)
 	n := binary.PutUvarint(seq[:], seqNo)
@@ -149,6 +152,7 @@ func logRecordKeyWithSeq(key []byte, seqNo uint64) []byte {
 	return encKey
 }
 
+// decode bytes to seq+key
 func parseLogRecordWithSeq(key []byte) ([]byte, uint64) {
 	seqNum, n := binary.Uvarint(key)
 	realKey := key[n:]

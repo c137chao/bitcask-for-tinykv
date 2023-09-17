@@ -27,7 +27,7 @@ func TestDB_WriteBatch_Basic(t *testing.T) {
 	wb.Put([]byte("ch-guangzhou"), []byte("value-guangzhou"))
 	wb.Put([]byte("ch-xian"), []byte("value-xian"))
 
-	log.Printf("[Log Transaction Sequence Number %v]", db.txnSeq)
+	log.Printf("[Log Transaction Sequence Number %v]", db.txnSeqNo)
 	wb.Commit()
 
 	wb.Put([]byte("usa-losangi"), []byte("value-losangi"))
@@ -50,11 +50,11 @@ func TestDB_WriteBatch_Basic(t *testing.T) {
 	err = db.Fold(fn)
 	assert.Nil(t, err)
 
-	log.Printf("[Log Transaction Sequence Number %v]", db.txnSeq)
+	log.Printf("[Log Transaction Sequence Number %v]", db.txnSeqNo)
 	wb.Commit()
 
 	fmt.Printf("\n\n")
-	log.Printf("[Log Transaction Sequence Number %v]", db.txnSeq)
+	log.Printf("[Log Transaction Sequence Number %v]", db.txnSeqNo)
 
 	db.Put([]byte("default-key"), []byte("default-value"))
 
@@ -138,7 +138,7 @@ func TestDB_WriteBatch2(t *testing.T) {
 	assert.Equal(t, ErrKeyNotFound, err)
 
 	// 校验序列号
-	assert.Equal(t, uint64(2), db.txnSeq)
+	assert.Equal(t, uint64(2), db.txnSeqNo)
 }
 
 //func TestDB_WriteBatch3(t *testing.T) {

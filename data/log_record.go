@@ -7,10 +7,6 @@ import (
 
 type LogRecordType = byte
 
-// -----------+----------+--------------+-----------------
-// |    CRC   |   Type   |   Key size   |   Value Size   |
-// -----------+----------+--------------+-----------------
-//
 // crc: 4byte, type: 1 byte, keysize and value size: 5(2^5 = 32)
 const LogRecordHeaderSize = binary.MaxVarintLen32*2 + 5
 
@@ -20,22 +16,28 @@ const (
 	LogRecordTxnFin
 )
 
+// log record header
+// crc + type + keysize + valuesize
+// keysize and value size store to disk as varint
 type LogRecordHeader struct {
-	Crc        uint32
-	RecordType LogRecordType
-	KeySize    uint32
-	ValSize    uint32
+	crc        uint32
+	recordType LogRecordType
+	keySize    uint32
+	valSize    uint32
 }
 
+// log record content
+// key + value + type
 type LogRecord struct {
 	Key   []byte
 	Value []byte
 	Type  LogRecordType
 }
 
-// data struce of keydir in memory
+// keydir value in memory
 type LogRecordPos struct {
 	FileId uint32
+	Size   uint32
 	Offset int64
 }
 
@@ -45,7 +47,8 @@ type TransactionRecord struct {
 	Pos    *LogRecordPos
 }
 
-//
+// encode logrecord to binary bytes,
+// return bytes and size
 func EncodeLogRecord(logRecord *LogRecord) ([]byte, int64) {
 	header := make([]byte, LogRecordHeaderSize)
 	var crcSize = 4
@@ -65,8 +68,8 @@ func EncodeLogRecord(logRecord *LogRecord) ([]byte, int64) {
 	copy(encRecord[:index], header[:index])
 
 	// copy key and value to encode Record
-	copy(encRecord[index:], logRecord.Key)
-	copy(encRecord[index+len(logRecord.Key):], logRecord.Value)
+	index += copy(encRecord[index:], logRecord.Key)
+	index += copy(encRecord[index:], logRecord.Value)
 
 	// caculate crc checking code
 	crc := crc32.ChecksumIEEE(encRecord[crcSize:])
@@ -75,22 +78,24 @@ func EncodeLogRecord(logRecord *LogRecord) ([]byte, int64) {
 	return encRecord, int64(size)
 }
 
+// decode binary bytes to logRecord header
+// return headerf and header size
 func DecodeLogRecordHeader(buf []byte) (*LogRecordHeader, int64) {
 	if len(buf) <= 4 {
 		return nil, 0
 	}
 
 	header := &LogRecordHeader{
-		Crc:        binary.LittleEndian.Uint32(buf[:4]),
-		RecordType: buf[4],
+		crc:        binary.LittleEndian.Uint32(buf[:4]),
+		recordType: buf[4],
 	}
 	index := 5
 	keySize, n := binary.Uvarint(buf[index:])
-	header.KeySize = uint32(keySize)
+	header.keySize = uint32(keySize)
 	index += n
 
 	valSize, m := binary.Uvarint(buf[index:])
-	header.ValSize = uint32(valSize)
+	header.valSize = uint32(valSize)
 	index += m
 
 	return header, int64(index)
@@ -109,10 +114,12 @@ func getRecordCRC(log *LogRecord, header []byte) uint32 {
 	return crc
 }
 
+// encord logrecordPos to bytes
 func EncodeLogRecordPos(pos *LogRecordPos) []byte {
 	buf := make([]byte, binary.MaxVarintLen32+binary.MaxVarintLen64)
 	var index = 0
-	index += binary.PutVarint(buf[index:], int64(pos.FileId))
+	index += binary.PutUvarint(buf[index:], uint64(pos.FileId))
+	index += binary.PutUvarint(buf[index:], uint64(pos.Size))
 	index += binary.PutVarint(buf[index:], pos.Offset)
 
 	return buf[:index]
@@ -120,12 +127,15 @@ func EncodeLogRecordPos(pos *LogRecordPos) []byte {
 
 func DecodeLogRecordPos(buf []byte) *LogRecordPos {
 	var index = 0
-	fileId, n := binary.Varint(buf[index:])
+	fileId, n := binary.Uvarint(buf[index:])
+	index += n
+	size, _ := binary.Uvarint(buf[index:])
 	index += n
 	offset, _ := binary.Varint(buf[index:])
 
 	return &LogRecordPos{
 		FileId: uint32(fileId),
+		Size:   uint32(size),
 		Offset: offset,
 	}
 }

@@ -12,31 +12,31 @@ import (
 func TestBTree_Put(t *testing.T) {
 	bt := newBTree(-1)
 	res := bt.Put(nil, &data.LogRecordPos{FileId: 1, Offset: 300})
-	assert.True(t, res)
+	assert.Nil(t, res)
 
 	res2 := bt.Put([]byte("a"), &data.LogRecordPos{FileId: 1, Offset: 2})
-	assert.True(t, res2)
+	assert.Nil(t, res2)
 }
 
 func TestBTree_Get(t *testing.T) {
 	bt := newBTree(-1)
 
 	res1 := bt.Put(nil, &data.LogRecordPos{FileId: 1, Offset: 300})
-	assert.True(t, res1)
+	assert.Nil(t, res1)
 
 	pos1 := bt.Get(nil)
 	assert.Equal(t, uint32(1), pos1.FileId)
 	assert.Equal(t, int64(300), pos1.Offset)
 
 	res2 := bt.Put([]byte("a"), &data.LogRecordPos{FileId: 1, Offset: 2})
-	assert.True(t, res2)
+	assert.Nil(t, res2)
 
 	pos2 := bt.Get([]byte("a"))
 	assert.Equal(t, uint32(1), pos2.FileId)
 	assert.Equal(t, int64(2), pos2.Offset)
 
 	res3 := bt.Put([]byte("b"), &data.LogRecordPos{FileId: 1, Offset: 10})
-	assert.True(t, res3)
+	assert.Nil(t, res3)
 
 	pos3 := bt.Get([]byte("b"))
 	assert.Equal(t, uint32(1), pos3.FileId)
@@ -59,9 +59,9 @@ func TestBTree_Delete(t *testing.T) {
 	pos3 := bt.Get([]byte("b"))
 	assert.True(t, pos3 != nil)
 
-	assert.True(t, bt.Delete(nil))
-	assert.True(t, bt.Delete(([]byte("a"))))
-	assert.True(t, bt.Delete(([]byte("b"))))
+	assert.NotNil(t, bt.Delete(nil))
+	assert.NotNil(t, bt.Delete(([]byte("a"))))
+	assert.NotNil(t, bt.Delete(([]byte("b"))))
 
 	assert.True(t, bt.Get(nil) == nil)
 	assert.True(t, bt.Get([]byte("a")) == nil)

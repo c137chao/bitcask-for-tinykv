@@ -2,7 +2,9 @@ package bitcaskgo
 
 import (
 	"bitcask-go/data"
+	"bitcask-go/fio"
 	"bitcask-go/index"
+	"bitcask-go/utils"
 	"errors"
 	"io"
 	"os"
@@ -12,43 +14,94 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/gofrs/flock"
 	"github.com/sirupsen/logrus"
 )
+
+const fileLockName = "flock"
 
 // DB is storage Engine of BitCask
 // it supports four opertion for upper application
 // Put, Get, Delete, Scan
 type DB struct {
-	options *Options // config info
-	mu      *sync.RWMutex
+	mu       *sync.RWMutex
+	filelock *flock.Flock // only on process can use DB
+
+	options Options // config options
 
 	// keydir in memory
 	// TODO: use a hash index to improve concurrency
-	index index.Indexer
-
-	fileIds    []int          // user for build index
+	index      index.Indexer
 	activeFile *data.DataFile // current active file
 	olderFiles map[uint32]*data.DataFile
-	txnSeq     uint64
-	isMerging  bool
+
+	txnSeqNo  uint64 // used for write bantch
+	isInitial bool   // used for
+	isMerging bool   //
+	fileIds   []int  // user for build index
+
+	bytesWrite  uint64 // bytes has been write
+	reclaimSize int64  // unvalid bytes has been write
 }
 
+type Stat struct {
+	KeyNum      uint
+	DataFileNum uint
+	ReclaimSize int64
+	DiskSize    int64
+}
+
+// return statistic info about db
+func (db *DB) Stat() *Stat {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	var dataFiles = uint(len(db.olderFiles))
+	if db.activeFile != nil {
+		dataFiles += 1
+	}
+
+	return &Stat{
+		KeyNum:      uint(db.index.Size()),
+		DataFileNum: dataFiles,
+		ReclaimSize: db.reclaimSize,
+		DiskSize:    0,
+	}
+
+}
+
+// open bitcask db
 func OpenDB(options Options) (*DB, error) {
 	if err := checkOptions(options); err != nil {
 		return nil, err
 	}
 
+	var isInitial bool
+
 	if _, err := os.Stat(options.DirPath); os.IsNotExist(err) {
+		isInitial = true
 		if err := os.Mkdir(options.DirPath, os.ModePerm); err != nil {
 			return nil, err
 		}
 	}
 
+	filelock := flock.New(filepath.Join(options.DirPath, fileLockName))
+	hold, err := filelock.TryLock()
+	if err != nil {
+		return nil, err
+	}
+
+	if !hold {
+		return nil, ErrDataBaseIsUsing
+	}
+
 	db := &DB{
-		options:    &options,
+		options:    options,
 		mu:         new(sync.RWMutex),
 		index:      index.NewIndexer(options.Index),
 		olderFiles: make(map[uint32]*data.DataFile),
+		isInitial:  isInitial,
+		filelock:   filelock,
 	}
 
 	// load merge file to work directory
@@ -70,10 +123,27 @@ func OpenDB(options Options) (*DB, error) {
 		return nil, err
 	}
 
+	if db.options.MMapAtStartup {
+		if err := db.resetIoType(); err != nil {
+			return nil, err
+		}
+	}
+
+	logrus.Infof("[Bitcask] OpenDB at %v, active fid: %v, total entries: %v\n",
+		options.DirPath, db.activeFile.FileId, db.index.Size())
+
 	return db, nil
 }
 
+// close bitcask db
+// free file lock and close all files
 func (db *DB) Close() error {
+	defer func() {
+		if err := db.filelock.Unlock(); err != nil {
+			logrus.Fatalf("err %v, failed to unlock the dir %v", err, db.options.DirPath)
+		}
+	}()
+
 	if db.activeFile == nil {
 		return nil
 	}
@@ -97,6 +167,7 @@ func (db *DB) Close() error {
 
 }
 
+// sync file to disk
 func (db *DB) Sync() error {
 	if db.activeFile == nil {
 		return nil
@@ -107,7 +178,15 @@ func (db *DB) Sync() error {
 	return db.activeFile.Sync()
 }
 
-//
+func (db *DB) Backup(dir string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	logrus.Infof("[bitcask] generate a backup to dir %v\n", dir)
+	return utils.Copy(db.options.DirPath, dir, []string{fileLockName})
+}
+
+// Append <key, value> to active file
 func (db *DB) Put(key []byte, value []byte) error {
 	if len(key) == 0 {
 		return ErrKeyIsEmpty
@@ -120,14 +199,13 @@ func (db *DB) Put(key []byte, value []byte) error {
 	}
 	// append log record to active file, return logRecordPos(fd, offset) of record
 	pos, err := db.appendLogRecordWithLock(&logRecord)
-
 	if err != nil {
 		return err
 	}
 
-	ok := db.index.Put(key, pos)
-	if !ok {
-		return ErrIndexUpdateFail
+	logrus.Debugf("[bitcask] %v put <%s, %s>, position <fid:%v, off:%v>\n", db.options.DirPath, key, value, pos.FileId, pos.Offset)
+	if oldpos := db.index.Put(key, pos); oldpos != nil {
+		db.reclaimSize += int64(oldpos.Size)
 	}
 
 	return nil
@@ -149,15 +227,20 @@ func (db *DB) Delete(key []byte) error {
 		Type: data.LogRecordDelete,
 	}
 
-	_, err := db.appendLogRecordWithLock(logRecord)
+	pos, err := db.appendLogRecordWithLock(logRecord)
 	if err != nil {
 		return nil
 	}
 
-	ok := db.index.Delete(key)
-	if !ok {
+	db.reclaimSize += int64(pos.Size)
+	deletePos := db.index.Delete(key)
+	if deletePos == nil {
 		return ErrIndexUpdateFail
 	}
+
+	logrus.Debugf("[bitcask] %v delete <%s>, position <fid:%v, off:%v>\n", db.options.DirPath, key, pos.FileId, pos.Offset)
+
+	db.reclaimSize += int64(deletePos.Size)
 
 	return nil
 }
@@ -175,6 +258,7 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	if pos == nil {
 		return nil, ErrKeyNotFound
 	}
+	logrus.Debugf("[bitcask] %v get <%s>, position <fid:%v, off:%v>\n", db.options.DirPath, key, pos.FileId, pos.Offset)
 
 	return db.getValueByPostion(pos)
 }
@@ -247,15 +331,19 @@ func (db *DB) appendLogRecord(logRecord *data.LogRecord) (*data.LogRecordPos, er
 		return nil, err
 	}
 
-	if db.options.SyncWrite {
+	db.bytesWrite += uint64(size)
+
+	if (db.options.SyncThreshHold != 0 && db.bytesWrite >= db.options.SyncThreshHold) || db.options.SyncWrite {
 		if err := db.activeFile.Sync(); err != nil {
 			return nil, err
 		}
+		db.bytesWrite = 0
 	}
 
 	pos := &data.LogRecordPos{
 		FileId: db.activeFile.FileId,
 		Offset: start,
+		Size:   uint32(size),
 	}
 
 	return pos, nil
@@ -264,18 +352,18 @@ func (db *DB) appendLogRecord(logRecord *data.LogRecord) (*data.LogRecordPos, er
 // create a new active datafile
 // caller must be hold lock
 func (db *DB) setActiveDataFile() error {
-	var initialFileId uint32 = 0
+	var activeFileId uint32 = 0
 
 	if db.activeFile != nil {
 		db.olderFiles[db.activeFile.FileId] = db.activeFile
-		initialFileId = db.activeFile.FileId + 1
+		activeFileId = db.activeFile.FileId + 1
 	}
 
-	dataFile, err := data.OpenDataFile(db.options.DirPath, initialFileId)
+	dataFile, err := data.OpenDataFile(db.options.DirPath, activeFileId, fio.StandFileIO)
 	if err != nil {
 		return err
 	}
-
+	logrus.Debugf("[bitcask] set active data file %v\n", activeFileId)
 	db.activeFile = dataFile
 	return nil
 }
@@ -287,23 +375,27 @@ func checkOptions(options Options) error {
 	if options.Maxsize <= 0 {
 		return errors.New("database data file size must be greater than 0")
 	}
+	if options.MergeRatio <= 0 || options.MergeRatio >= 1 {
+		return errors.New("unvalid merge ration which should 0 < mergeratio < 1")
+	}
 
 	return nil
 }
 
 // helper functions, add keyDir item to memory Index
 func (db *DB) updateIndex(key []byte, typ data.LogRecordType, pos *data.LogRecordPos) {
-	var ok bool
+	var oldPos *data.LogRecordPos
 	if typ == data.LogRecordDelete {
-		ok = db.index.Delete(key)
+		oldPos = db.index.Delete(key)
+		db.reclaimSize += int64(pos.Size)
 	} else {
-		ok = db.index.Put(key, pos)
+		oldPos = db.index.Put(key, pos)
 	}
 
-	if !ok {
-		// logrus.Errorf("Delete a un-exist key %s", key)
-		// log.Panicf("failed to update key %s index at startup", key)
+	if oldPos != nil {
+		db.reclaimSize += int64(oldPos.Size)
 	}
+
 }
 
 // load datafile from disk
@@ -332,10 +424,12 @@ func (db *DB) loadDataFile() error {
 	sort.Ints(fileIds)
 	db.fileIds = fileIds
 
-	logrus.Infof("Load data File %v", fileIds)
-
 	for i, fid := range fileIds {
-		dataFile, err := data.OpenDataFile(db.options.DirPath, uint32(fid))
+		iotyp := fio.StandFileIO
+		if db.options.MMapAtStartup {
+			iotyp = fio.MemoryMapIO
+		}
+		dataFile, err := data.OpenDataFile(db.options.DirPath, uint32(fid), iotyp)
 		if err != nil {
 			return err
 		}
@@ -356,7 +450,7 @@ func (db *DB) loadIndexFromDateFile() error {
 		return nil
 	}
 
-	hasMerge, nonMergeFid := false, uint32(0)
+	nonMergeFid := uint32(0)
 	hintFinFileName := filepath.Join(db.options.DirPath, data.HintFinFileName)
 
 	if _, err := os.Stat(hintFinFileName); err == nil {
@@ -364,7 +458,6 @@ func (db *DB) loadIndexFromDateFile() error {
 		if err != nil {
 			return err
 		}
-		hasMerge = true
 		nonMergeFid = fid
 	}
 
@@ -377,7 +470,7 @@ func (db *DB) loadIndexFromDateFile() error {
 		var fileid = uint32(fid)
 
 		// skip file has been merged
-		if hasMerge && fileid < nonMergeFid {
+		if fileid < nonMergeFid {
 			continue
 		}
 
@@ -390,15 +483,15 @@ func (db *DB) loadIndexFromDateFile() error {
 		var offset int64 = 0
 		for {
 			logRecord, size, err := dataFile.ReadLogRecord(offset)
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
+			if err == io.EOF {
+				break
+			}
+			if err != nil { // err not nil and not eof
 				return err
 			}
 
 			// insert keydir entry to index
-			pos := &data.LogRecordPos{FileId: fileid, Offset: offset}
+			pos := &data.LogRecordPos{FileId: fileid, Offset: offset, Size: uint32(size)}
 			realKey, seqNo := parseLogRecordWithSeq(logRecord.Key)
 
 			// Not write batch
@@ -426,19 +519,20 @@ func (db *DB) loadIndexFromDateFile() error {
 			}
 
 			offset += size
+		}
 
-			if i == len(db.fileIds)-1 {
-				db.activeFile.WriteOff = offset
-			}
+		if i == len(db.fileIds)-1 {
+			db.activeFile.WriteOff = offset
 		}
 	}
 
-	db.txnSeq = curSeqNo
+	db.txnSeqNo = curSeqNo
 
 	return nil
 }
 
 func (db *DB) getValueByPostion(pos *data.LogRecordPos) ([]byte, error) {
+	logrus.Infof("get value from file %v, offset %v\n", pos.FileId, pos.Offset)
 	datafile := db.activeFile
 	if pos.FileId != datafile.FileId {
 		datafile = db.olderFiles[pos.FileId]
@@ -458,4 +552,21 @@ func (db *DB) getValueByPostion(pos *data.LogRecordPos) ([]byte, error) {
 	}
 
 	return logrecord.Value, nil
+}
+
+func (db *DB) resetIoType() error {
+	if db.activeFile == nil {
+		return nil
+	}
+	if err := db.activeFile.SetIoMananger(db.options.DirPath, fio.StandFileIO); err != nil {
+		return err
+	}
+
+	for _, datafile := range db.olderFiles {
+		if err := datafile.SetIoMananger(db.options.DirPath, fio.StandFileIO); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

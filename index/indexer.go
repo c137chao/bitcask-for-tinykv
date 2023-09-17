@@ -2,29 +2,29 @@ package index
 
 import (
 	"bitcask-go/data"
-	"bytes"
-
-	"github.com/google/btree"
 )
 
 type IndexType = int8
+type IndexKeyType = []byte
+type IndexValueType = *data.LogRecordPos
 
 const (
 	BTREE IndexType = iota + 1
-	ART
+	RBTREE
+	ARTREE
 	BPLUSTREE
 )
 
 // in-memory key dir interface
 type Indexer interface {
-	// put <key, value> to btree, return true if put success, false else
-	Put(key []byte, value *data.LogRecordPos) bool
+	// put <key, value> to btree, return nil if key doesn't, else old value
+	Put(key []byte, value IndexValueType) IndexValueType
 
 	// get value with key, value is rid of data, return nil if key doesn't exist
-	Get(key []byte) *data.LogRecordPos
+	Get(key []byte) IndexValueType
 
-	// delete item with key, return true is delete successm false else
-	Delete(key []byte) bool
+	// delete item with key, return old value if delete successm, nil if key doesn't exist
+	Delete(key []byte) IndexValueType
 
 	// create a iterator for index
 	Iterator(reverse bool) Iterator
@@ -60,16 +60,9 @@ func NewIndexer(typ IndexType) Indexer {
 	switch typ {
 	case BTREE:
 		return newBTree(-1)
+	case RBTREE:
+		return NewRBTree()
 	default:
 		panic("unsopported index type")
 	}
-}
-
-type Item struct {
-	key []byte
-	val *data.LogRecordPos
-}
-
-func (it Item) Less(than btree.Item) bool {
-	return bytes.Compare(it.key, than.(*Item).key) == -1
 }

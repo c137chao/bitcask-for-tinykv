@@ -4,7 +4,10 @@ import (
 	"bitcask-go/utils"
 	"log"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -304,4 +307,112 @@ func TestDB_Fold(t *testing.T) {
 	err = db.Fold(fn)
 	assert.Nil(t, err)
 
+}
+
+func TestDB_FileLock_Open(t *testing.T) {
+	opts := DefaultOptions
+	dir, _ := os.MkdirTemp("", "bitcask-go-filelock")
+	opts.DirPath = dir
+
+	wg := new(sync.WaitGroup)
+	wg.Add(2)
+
+	var idx int32 = 0
+	go func() {
+		db, err := OpenDB(opts)
+		defer destroyDB(db)
+
+		i := atomic.AddInt32(&idx, 1)
+		t.Logf("%v %v", i, db)
+		t.Logf("%v %v", i, err)
+
+		wg.Done()
+	}()
+
+	go func() {
+		db, err := OpenDB(opts)
+		defer destroyDB(db)
+
+		i := atomic.AddInt32(&idx, 1)
+		t.Logf("%v %v", i, db)
+		t.Logf("%v %v", i, err)
+		wg.Done()
+	}()
+
+	wg.Wait()
+
+}
+
+func TestDB_FileLock_Close(t *testing.T) {
+	opts := DefaultOptions
+	dir, _ := os.MkdirTemp("", "bitcask-go-filelock")
+	opts.DirPath = dir
+
+	db, err := OpenDB(opts)
+	defer destroyDB(db)
+
+	assert.NotNil(t, db)
+	assert.Nil(t, err)
+
+	db2, err := OpenDB(opts)
+	assert.Nil(t, db2)
+	assert.Equal(t, err, ErrDataBaseIsUsing)
+
+	db.Close()
+
+	db, err = OpenDB(opts)
+
+	assert.NotNil(t, db)
+	assert.Nil(t, err)
+}
+
+func TestDB_Memorymap_Open(t *testing.T) {
+	opts := DefaultOptions
+	dir, _ := os.MkdirTemp("", "bitcask-go-filelock")
+	opts.DirPath = dir
+
+	db, _ := OpenDB(opts)
+	defer destroyDB(db)
+
+	for i := 0; i < 1000000; i++ {
+		db.Put(utils.GetTestKey(i), utils.GetTestValue(i, 1024))
+	}
+	db.Close()
+
+	now := time.Now()
+	db, _ = OpenDB(opts)
+	log.Printf("open time with mmap: %v\n", time.Since(now))
+
+	db.Close()
+
+	opts.MMapAtStartup = false
+
+	now = time.Now()
+	db, _ = OpenDB(opts)
+	log.Printf("open time with standardio: %v\n", time.Since(now))
+
+	db.Close()
+}
+
+func TestDB_Stat(t *testing.T) {
+	opts := DefaultOptions
+	dir, _ := os.MkdirTemp("", "bitcask-go-stat")
+	opts.DirPath = dir
+
+	db, err := OpenDB(opts)
+	defer destroyDB(db)
+
+	assert.Nil(t, err)
+	assert.NotNil(t, db)
+
+	for i := 0; i < 10000; i++ {
+		db.Put(utils.GetTestKey(i), utils.GetTestValue(i, 1024))
+	}
+
+	for i := 5000; i < 10000; i++ {
+		db.Delete(utils.GetTestKey(i))
+	}
+
+	stat := db.Stat()
+	t.Log(stat)
 }

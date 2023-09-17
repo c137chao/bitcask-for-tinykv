@@ -2,6 +2,7 @@ package bitcaskgo
 
 import (
 	"bitcask-go/data"
+	"bitcask-go/utils"
 	"io"
 	"os"
 	"path"
@@ -15,6 +16,58 @@ import (
 const MergeDir = ".merge"
 const MergeFinKey = "merge.Fin"
 
+func (db *DB) getAllOlderFiles() []*data.DataFile {
+	var mergeFiles []*data.DataFile
+	for _, file := range db.olderFiles {
+		mergeFiles = append(mergeFiles, file)
+	}
+
+	return mergeFiles
+}
+
+func (db *DB) checkMergeAvaliable() error {
+	totalSize, err := utils.DirSize(db.options.DirPath)
+	if err != nil {
+		return err
+	}
+	actualRatio := float32(db.reclaimSize) / float32(totalSize)
+	if actualRatio < db.options.MergeRatio {
+		logrus.Infof("Merge failed: actual ratio : %v, expected ratio: %v [reclaimSize:%v, totalSize:%v]\n", actualRatio, db.options.MergeRatio, db.reclaimSize, totalSize)
+		return nil
+	}
+
+	avaliableDiskSize, err := utils.AvaliableDiskSzie()
+	if err != nil {
+		return err
+	}
+
+	if uint64(totalSize-db.reclaimSize) >= avaliableDiskSize {
+		return ErrNoEnoughSpaceForMerge
+	}
+
+	return nil
+}
+
+func (db *DB) tryStartMerging() error {
+	if db.isMerging {
+		return ErrMergeIsPorgress
+	}
+
+	if err := db.checkMergeAvaliable(); err != nil {
+		return err
+	}
+	// start merging
+	if err := db.activeFile.Sync(); err != nil {
+		return err
+	}
+
+	if err := db.setActiveDataFile(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 //  Merge scan the index
 //
 //
@@ -25,34 +78,19 @@ func (db *DB) Merge() error {
 	}
 
 	db.mu.Lock()
-	if db.isMerging {
+
+	if err := db.tryStartMerging(); err != nil {
 		db.mu.Unlock()
-		return ErrMergeIsPorgress
+		return err
 	}
+
 	db.isMerging = true
 	defer func() {
 		db.isMerging = false
 	}()
 
-	// start merging
-	if err := db.activeFile.Sync(); err != nil {
-		db.mu.Unlock()
-		return err
-	}
-
-	if err := db.setActiveDataFile(); err != nil {
-		db.mu.Unlock()
-		return err
-	}
-
 	nonMergeFid := db.activeFile.FileId
-
-	// merge files store all data file need to merge
-	var mergeFiles []*data.DataFile
-
-	for _, file := range db.olderFiles {
-		mergeFiles = append(mergeFiles, file)
-	}
+	mergeFiles := db.getAllOlderFiles()
 
 	db.mu.Unlock()
 
@@ -60,16 +98,17 @@ func (db *DB) Merge() error {
 	sort.Slice(mergeFiles, func(i, j int) bool {
 		return mergeFiles[i].FileId < mergeFiles[j].FileId
 	})
+
 	logrus.Infof("[Bitcask] Merge from %v to %v", mergeFiles[0].FileId, nonMergeFid-1)
 
 	mergePath := db.getMergePath()
-	// remove all old merge records on disk
-	if _, err := os.Stat(mergePath); err != nil {
-		if err := os.RemoveAll(mergePath); err != nil {
-			return err
-		}
+
+	// remove all old merge files on disk
+	if err := os.RemoveAll(mergePath); err != nil {
+		return err
 	}
 
+	// create new merge  dir
 	if err := os.MkdirAll(mergePath, os.ModePerm); err != nil {
 		return err
 	}
@@ -78,7 +117,7 @@ func (db *DB) Merge() error {
 	mergeOptions.DirPath = mergePath
 	mergeOptions.SyncWrite = false
 
-	mergeDB, err := OpenDB(*mergeOptions)
+	mergeDB, err := OpenDB(mergeOptions)
 	if err != nil {
 		return err
 	}
@@ -93,10 +132,10 @@ func (db *DB) Merge() error {
 		var offset int64 = 0
 		for {
 			logRecord, size, err := dataFile.ReadLogRecord(offset)
+			if err == io.EOF {
+				break
+			}
 			if err != nil {
-				if err == io.EOF {
-					break
-				}
 				return err
 			}
 			realkey, _ := parseLogRecordWithSeq(logRecord.Key)
@@ -108,11 +147,12 @@ func (db *DB) Merge() error {
 			// if log record is newest record of key
 			if pos != nil && pos.FileId == dataFile.FileId && pos.Offset == offset {
 				logRecord.Key = logRecordKeyWithSeq(realkey, nonTxnSeqno)
+				// append log record to mergedb active datafile
 				pos, err := mergeDB.appendLogRecord(logRecord)
 				if err != nil {
 					return err
 				}
-
+				// append index logrecord pos to hint file
 				if err := hintFile.WriteHintRecord(realkey, pos); err != nil {
 					return err
 				}
@@ -190,6 +230,9 @@ func (db *DB) loaderMergeFiles() error {
 		if ent.Name() == data.HintFinFileName {
 			mergeFinished = true
 		}
+		if ent.Name() == fileLockName {
+			continue
+		}
 		mergefileNames = append(mergefileNames, ent.Name())
 	}
 
@@ -224,6 +267,7 @@ func (db *DB) loaderMergeFiles() error {
 	return nil
 }
 
+// get file id of first file which hasn't been merging
 func (db *DB) getNonMergeFileId(dirPath string) (uint32, error) {
 	finFile, err := data.OpenMergeFinFile(dirPath)
 	if err != nil {

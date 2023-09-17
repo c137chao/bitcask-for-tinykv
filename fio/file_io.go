@@ -2,8 +2,7 @@ package fio
 
 import "os"
 
-// implement IOManager
-// FileIO just encapsulation go stand file io operation
+// standard file io
 type FileIO struct {
 	file *os.File
 }

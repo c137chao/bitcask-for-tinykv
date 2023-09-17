@@ -18,6 +18,15 @@ type BTree struct {
 	mu   *sync.RWMutex
 }
 
+type BTreeItem struct {
+	key []byte
+	val *data.LogRecordPos
+}
+
+func (it BTreeItem) Less(than btree.Item) bool {
+	return bytes.Compare(it.key, than.(*BTreeItem).key) == -1
+}
+
 // create new a btree
 func newBTree(degree int) *BTree {
 	if degree < 2 {
@@ -29,17 +38,20 @@ func newBTree(degree int) *BTree {
 	}
 }
 
-func (bt *BTree) Put(key []byte, pos *data.LogRecordPos) bool {
-	it := &Item{key: key, val: pos}
+func (bt *BTree) Put(key []byte, pos *data.LogRecordPos) IndexValueType {
+	it := &BTreeItem{key: key, val: pos}
 	bt.mu.Lock()
-	bt.tree.ReplaceOrInsert(it)
-	bt.mu.Unlock()
+	defer bt.mu.Unlock()
+	oldItem := bt.tree.ReplaceOrInsert(it)
 
-	return true
+	if oldItem == nil {
+		return nil
+	}
+	return oldItem.(*BTreeItem).val
 }
 
-func (bt *BTree) Get(key []byte) *data.LogRecordPos {
-	it := &Item{key: key}
+func (bt *BTree) Get(key []byte) IndexValueType {
+	it := &BTreeItem{key: key}
 	bt.mu.RLock()
 	defer bt.mu.RUnlock()
 
@@ -47,17 +59,20 @@ func (bt *BTree) Get(key []byte) *data.LogRecordPos {
 	if getResult == nil {
 		return nil
 	}
-	return getResult.(*Item).val
+	return getResult.(*BTreeItem).val
 }
 
-func (bt *BTree) Delete(key []byte) bool {
-	it := &Item{key: key}
+func (bt *BTree) Delete(key []byte) IndexValueType {
+	it := &BTreeItem{key: key}
 	bt.mu.Lock()
 	defer bt.mu.Unlock()
 
-	oldItem := bt.tree.Delete(it)
+	deleteItem := bt.tree.Delete(it)
+	if deleteItem == nil {
+		return nil
+	}
 
-	return oldItem != nil
+	return deleteItem.(*BTreeItem).val
 }
 
 func (bt *BTree) Iterator(reverse bool) Iterator {
@@ -79,15 +94,15 @@ func (bt *BTree) Size() int {
 type btreeIterator struct {
 	currIndex int //
 	reverse   bool
-	values    []*Item
+	values    []*BTreeItem
 }
 
 func newBtreeIter(tree *btree.BTree, reverse bool) *btreeIterator {
 	var idx int
-	values := make([]*Item, tree.Len())
+	values := make([]*BTreeItem, tree.Len())
 
 	saveValues := func(it btree.Item) bool {
-		values[idx] = it.(*Item)
+		values[idx] = it.(*BTreeItem)
 		idx++
 		return true
 	}
