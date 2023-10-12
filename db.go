@@ -129,8 +129,8 @@ func OpenDB(options Options) (*DB, error) {
 		}
 	}
 
-	logrus.Infof("[Bitcask] OpenDB at %v, active fid: %v, total entries: %v\n",
-		options.DirPath, db.activeFile.FileId, db.index.Size())
+	logrus.Infof("[Bitcask] OpenDB at %v, total entries: %v\n",
+		options.DirPath, db.index.Size())
 
 	return db, nil
 }
